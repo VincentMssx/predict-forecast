@@ -1,4 +1,3 @@
-
 import sys
 import pandas as pd
 import requests
@@ -12,9 +11,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-############################
-# 1. Get Data
-############################
+################################################################################
+# 1. Get Data (Using a longer, more robust date range for better training)
+################################################################################
 
 # --- Configuration ---
 LATITUDE = 46.244
@@ -24,321 +23,174 @@ END_DATE = "2025-09-13"
 
 # --- Function to Fetch Data from Open-Meteo ---
 def fetch_weather_data(api_url, params):
-    """Fetches data from the Open-Meteo API and returns a pandas DataFrame."""
     try:
         response = requests.get(api_url, params=params)
-        response.raise_for_status()  # Raise an exception for bad status codes
+        response.raise_for_status()
         data = response.json()
-        # print(data)
-        
         hourly_data = data['hourly']
         df = pd.DataFrame(hourly_data)
         df['time'] = pd.to_datetime(df['time'])
         df.set_index('time', inplace=True)
-        
         return df
     except requests.exceptions.RequestException as e:
         print(f"Error fetching data: {e}")
+        if 'response' in locals() and response.text:
+            print(f"API Response: {response.json().get('reason', 'No reason provided')}")
         return None
     except KeyError:
-        print("Error: 'hourly' key not found in API response. Check your parameters.")
+        print("Error: 'hourly' key not found in API response.")
         return None
 
-# --- 1. Fetch Ground Truth (Historical Reanalysis) Data ---
+# --- Fetch Ground Truth Data ---
 print("Fetching ground truth data (ERA5)...")
 historical_api_url = "https://archive-api.open-meteo.com/v1/archive"
 params_ground_truth = {
-    "latitude": LATITUDE,
-    "longitude": LONGITUDE,
-    "start_date": START_DATE,
-    "end_date": END_DATE,
-    "hourly": "windspeed_10m,winddirection_10m"
+    "latitude": LATITUDE, "longitude": LONGITUDE, "start_date": START_DATE,
+    "end_date": END_DATE, "hourly": "windspeed_10m,winddirection_10m"
 }
 ground_truth_df = fetch_weather_data(historical_api_url, params_ground_truth)
 ground_truth_df.rename(columns={'windspeed_10m': 'gt_windspeed', 'winddirection_10m': 'gt_winddirection'}, inplace=True)
 
-# --- 2. Fetch Historical Forecast Data for Different Models ---
+# --- Fetch Historical Forecast Data ---
 print("Fetching forecast data...")
 forecast_api_url = "https://api.open-meteo.com/v1/forecast"
 forecast_models = ["arome_france", "gfs_seamless"]
 forecast_dfs = {}
-
 for model in forecast_models:
     print(f"  - Fetching {model}...")
     params_forecast = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
-        "start_date": START_DATE,
-        "end_date": END_DATE,
-        "hourly": "windspeed_10m,winddirection_10m",
-        "models": model
+        "latitude": LATITUDE, "longitude": LONGITUDE, "start_date": START_DATE,
+        "end_date": END_DATE, "hourly": "windspeed_10m,winddirection_10m", "models": model
     }
     df = fetch_weather_data(forecast_api_url, params_forecast)
     if df is not None:
-        forecast_dfs[model] = df.rename(columns={'windspeed_10m': f'{model}_windspeed', 'winddirection_10m': f'{model}_winddirection'})
+        df.rename(columns={
+            'windspeed_10m': f'{model}_windspeed',
+            'winddirection_10m': f'{model}_winddirection'
+        }, inplace=True)
+        forecast_dfs[model] = df
 
-# --- 3. Combine all data into a single DataFrame ---
+
+# --- Combine Data ---
 print("Combining all data sources...")
 if ground_truth_df is not None and forecast_dfs:
-    final_df = ground_truth_df.copy()
+    final_df = ground_truth_df
     for model_name, forecast_df in forecast_dfs.items():
         final_df = final_df.join(forecast_df, how='inner')
-
-    # Drop rows with any missing values
     final_df.dropna(inplace=True)
+    if final_df.empty:
+        print("No overlapping data found. Exiting.")
+        exit()
     print("Data successfully downloaded and combined.")
-    print(final_df.head())
 else:
     print("Failed to download or combine data. Exiting.")
     exit()
 
-# --- Exploratory Data Analysis ---
 
-print("\n--- Starting Exploratory Data Analysis ---")
-print(final_df.describe())
+################################################################################
+# 2. Data Preparation and Vector Conversion
+################################################################################
 
-# 1. Time Series Plot of Wind Speed
-plt.figure(figsize=(15, 8))
-plt.plot(final_df.index, final_df['gt_windspeed'], label='Ground Truth', alpha=0.8)
-plt.plot(final_df.index, final_df['arome_france_windspeed'], label='AROME Forecast', alpha=0.7)
-plt.plot(final_df.index, final_df['gfs_seamless_windspeed'], label='GFS Forecast', alpha=0.7)
-plt.title('Wind Speed: Ground Truth vs. Forecast Models (Sample)')
-plt.xlabel('Date')
-plt.ylabel('Wind Speed (km/h)')
-plt.legend()
-# Limit to one month for better readability
-plt.xlim(final_df.index[0], final_df.index[0] + pd.Timedelta(days=12))
-plt.show()
-
-############################
-# 2. Distribution of Wind Speed (Histograms)
-############################
-
-plt.figure(figsize=(12, 6))
-sns.histplot(final_df['gt_windspeed'], color='black', label='Ground Truth', kde=True, stat="density")
-sns.histplot(final_df['arome_france_windspeed'], color='blue', label='AROME', kde=True, stat="density")
-sns.histplot(final_df['gfs_seamless_windspeed'], color='green', label='GFS', kde=True, stat="density")
-plt.title('Distribution of Wind Speeds')
-plt.xlabel('Wind Speed (km/h)')
-plt.legend()
-plt.show()
-
-# 3. Handling Wind Direction (Circular Data)
-# For analysis, we convert angles to vector components (U, V)
+# *** THIS IS THE CORRECTED, MORE ROBUST to_vector FUNCTION ***
 def to_vector(df):
-    for col in df.columns:
-        if 'winddirection' in col:
-            rad = np.deg2rad(df[col])
-            df[col.replace('direction', '_u')] = -np.sin(rad)
-            df[col.replace('direction', '_v')] = -np.cos(rad)
-    return df
-
-df_vectors = final_df.copy()
-df_vectors = to_vector(df_vectors)
-
-# 4. Scatter Plots to show correlation between forecasts and ground truth
-fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-sns.scatterplot(ax=axes[0], x='gt_windspeed', y='arome_france_windspeed', data=df_vectors, alpha=0.5)
-axes[0].plot([0, 80], [0, 80], 'r--') # Perfect forecast line
-axes[0].set_title('AROME vs. Ground Truth Wind Speed')
-axes[0].set_xlabel('Ground Truth Speed (km/h)')
-axes[0].set_ylabel('AROME Forecasted Speed (km/h)')
-
-sns.scatterplot(ax=axes[1], x='gt_windspeed', y='gfs_seamless_windspeed', data=df_vectors, alpha=0.5)
-axes[1].plot([0, 80], [0, 80], 'r--')
-axes[1].set_title('GFS vs. Ground Truth Wind Speed')
-axes[1].set_xlabel('Ground Truth Speed (km/h)')
-axes[1].set_ylabel('GFS Forecasted Speed (km/h)')
-plt.tight_layout()
-plt.show()
-
-
-# 5. Wind Rose for Direction
-# A proper wind rose requires a specialized library, but a polar plot gives a good idea.
-plt.figure(figsize=(10, 10))
-ax = plt.subplot(111, polar=True)
-ax.set_theta_zero_location('N')
-ax.set_theta_direction(-1)
-ax.hist(np.deg2rad(final_df['gt_winddirection']), bins=36, alpha=0.7, label='Ground Truth')
-ax.hist(np.deg2rad(final_df['arome_france_winddirection']), bins=36, alpha=0.6, label='AROME')
-plt.title('Wind Direction Distribution (Ground Truth vs. AROME)')
-plt.legend()
-plt.show()
-
-# --- Exploratory Data Analysis ---
-
-print("\n--- Starting Exploratory Data Analysis ---")
-print(final_df.describe())
-
-# 1. Time Series Plot of Wind Speed
-plt.figure(figsize=(15, 8))
-plt.plot(final_df.index, final_df['gt_windspeed'], label='Ground Truth', alpha=0.8)
-plt.plot(final_df.index, final_df['arome_france_windspeed'], label='AROME Forecast', alpha=0.7)
-plt.plot(final_df.index, final_df['gfs_seamless_windspeed'], label='GFS Forecast', alpha=0.7)
-plt.title('Wind Speed: Ground Truth vs. Forecast Models (Sample)')
-plt.xlabel('Date')
-plt.ylabel('Wind Speed (km/h)')
-plt.legend()
-# Limit to one month for better readability
-plt.xlim(final_df.index[0], final_df.index[0] + pd.Timedelta(days=12))
-plt.show()
-
-
-# 2. Distribution of Wind Speed (Histograms)
-plt.figure(figsize=(12, 6))
-sns.histplot(final_df['gt_windspeed'], color='black', label='Ground Truth', kde=True, stat="density")
-sns.histplot(final_df['arome_france_windspeed'], color='blue', label='AROME', kde=True, stat="density")
-sns.histplot(final_df['gfs_seamless_windspeed'], color='green', label='GFS', kde=True, stat="density")
-plt.title('Distribution of Wind Speeds')
-plt.xlabel('Wind Speed (km/h)')
-plt.legend()
-plt.show()
-
-# 3. Handling Wind Direction (Circular Data)
-# For analysis, we convert angles to vector components (U, V)
-def to_vector(df):
-    for col in df.columns:
-        if 'winddirection' in col:
-            rad = np.deg2rad(df[col])
-            df[col.replace('direction', '_u')] = -np.sin(rad)
-            df[col.replace('direction', '_v')] = -np.cos(rad)
-    return df
-
-df_vectors = final_df.copy()
-df_vectors = to_vector(df_vectors)
-
-# 4. Scatter Plots to show correlation between forecasts and ground truth
-fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-sns.scatterplot(ax=axes[0], x='gt_windspeed', y='arome_france_windspeed', data=df_vectors, alpha=0.5)
-axes[0].plot([0, 80], [0, 80], 'r--') # Perfect forecast line
-axes[0].set_title('AROME vs. Ground Truth Wind Speed')
-axes[0].set_xlabel('Ground Truth Speed (km/h)')
-axes[0].set_ylabel('AROME Forecasted Speed (km/h)')
-
-sns.scatterplot(ax=axes[1], x='gt_windspeed', y='gfs_seamless_windspeed', data=df_vectors, alpha=0.5)
-axes[1].plot([0, 80], [0, 80], 'r--')
-axes[1].set_title('GFS vs. Ground Truth Wind Speed')
-axes[1].set_xlabel('Ground Truth Speed (km/h)')
-axes[1].set_ylabel('GFS Forecasted Speed (km/h)')
-plt.tight_layout()
-plt.show()
-
-
-# 5. Wind Rose for Direction
-# A proper wind rose requires a specialized library, but a polar plot gives a good idea.
-plt.figure(figsize=(10, 10))
-ax = plt.subplot(111, polar=True)
-ax.set_theta_zero_location('N')
-ax.set_theta_direction(-1)
-ax.hist(np.deg2rad(final_df['gt_winddirection']), bins=36, alpha=0.7, label='Ground Truth')
-ax.hist(np.deg2rad(final_df['arome_france_winddirection']), bins=36, alpha=0.6, label='AROME')
-plt.title('Wind Direction Distribution (Ground Truth vs. AROME)')
-plt.legend()
-plt.show()
-
-############################
-# 3. Model Evaluation
-############################
-
-# --- Scikit-learn: Performance Evaluation ---
-print("\n--- Evaluating Models with Scikit-learn ---")
-
-def to_vector(df):
-    """
-    Calculates u and v wind components from speed and direction columns.
-    It correctly infers column names and uses speed in the calculation.
-    """
-    # Find all wind direction columns
     direction_cols = [col for col in df.columns if 'winddirection' in col]
-    
     for dir_col in direction_cols:
-        # Infer the corresponding speed column and the prefix
         speed_col = dir_col.replace('winddirection', 'windspeed')
         prefix = dir_col.replace('winddirection', '')
-        
-        # Check if the matching speed column exists
         if speed_col in df.columns:
-            # Get the actual speed and direction data
             speed = df[speed_col]
             direction_rad = np.deg2rad(df[dir_col])
-            
-            # Calculate u and v components (the correct way)
-            # The negative signs are a meteorological convention for "wind from"
             df[f'{prefix}u'] = -speed * np.sin(direction_rad)
             df[f'{prefix}v'] = -speed * np.cos(direction_rad)
-        else:
-            print(f"Warning: Found direction column '{dir_col}' but no matching speed column '{speed_col}'. Skipping.")
     return df
 
-# Create the new DataFrame with the correct vectors
-df_vectors = final_df.copy()
-df_vectors = to_vector(df_vectors)
-
-# Now check if the columns were created successfully
-print("\nColumns created after vector conversion:")
-print([col for col in df_vectors.columns if '_u' in col or '_v' in col])
+df_vectors = to_vector(final_df.copy())
+print(df_vectors.describe())
+print("\nVector columns created successfully.")
 
 
-# 4. Scatter Plots to show correlation between forecasts and ground truth
-fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-sns.scatterplot(ax=axes[0], x='gt_windspeed', y='arome_france_windspeed', data=df_vectors, alpha=0.5)
-axes[0].plot([0, 80], [0, 80], 'r--') # Perfect forecast line
-axes[0].set_title('AROME vs. Ground Truth Wind Speed')
-axes[0].set_xlabel('Ground Truth Speed (km/h)')
-axes[0].set_ylabel('AROME Forecasted Speed (km/h)')
+################################################################################
+# 3. Model Evaluation (Overall and by Direction)
+################################################################################
 
-sns.scatterplot(ax=axes[1], x='gt_windspeed', y='gfs_seamless_windspeed', data=df_vectors, alpha=0.5)
-axes[1].plot([0, 80], [0, 80], 'r--')
-axes[1].set_title('GFS vs. Ground Truth Wind Speed')
-axes[1].set_xlabel('Ground Truth Speed (km/h)')
-axes[1].set_ylabel('GFS Forecasted Speed (km/h)')
-plt.tight_layout()
-plt.show()
-
-
-# We use the vector components for direction error calculation
+print("\n--- Evaluating Models with Scikit-learn (Overall Performance) ---")
 y_true_speed = df_vectors['gt_windspeed']
 y_true_u = df_vectors['gt_u']
 y_true_v = df_vectors['gt_v']
-
 results = {}
 
 for model in forecast_models:
-    # Speed evaluation
     y_pred_speed = df_vectors[f'{model}_windspeed']
     mae_speed = mean_absolute_error(y_true_speed, y_pred_speed)
     rmse_speed = np.sqrt(mean_squared_error(y_true_speed, y_pred_speed))
     
-    # Direction evaluation (using vectors)
     y_pred_u = df_vectors[f'{model}_u']
     y_pred_v = df_vectors[f'{model}_v']
-    
-    # Vectorial difference error
-    # This measures the magnitude of the error vector between true and predicted wind
     direction_error = np.sqrt((y_true_u - y_pred_u)**2 + (y_true_v - y_pred_v)**2)
     mae_direction = direction_error.mean()
     
     results[model] = {'MAE_Speed': mae_speed, 'RMSE_Speed': rmse_speed, 'MAE_Direction_Vector': mae_direction}
 
-# Display results
 results_df = pd.DataFrame(results).T
-print("\nEvaluation Metrics (Lower is better):")
 print(results_df.sort_values(by='RMSE_Speed'))
 
-############################
-# 4. Meta-Forecast Evaluation 
-############################
+# ### NEW SECTION: METHOD 1 - ANALYZE PERFORMANCE BY WIND DIRECTION ###
+print("\n--- Evaluating Models by Wind Direction Sector ---")
 
-# --- PyTorch: Building a Corrective Model ---
-print("\n--- Building a Corrective Model with PyTorch ---")
+def get_wind_sector(deg):
+    if 337.5 <= deg <= 360 or 0 <= deg < 22.5: return 'N'
+    if 22.5 <= deg < 67.5: return 'NE'
+    if 67.5 <= deg < 112.5: return 'E'
+    if 112.5 <= deg < 157.5: return 'SE'
+    if 157.5 <= deg < 202.5: return 'S'
+    if 202.5 <= deg < 247.5: return 'SW'
+    if 247.5 <= deg < 292.5: return 'W'
+    if 292.5 <= deg < 337.5: return 'NW'
 
-# 1. Prepare Data
-# Features are the predictions from all models
-features = df_vectors[[f'{model}_windspeed' for model in forecast_models] +
-                      [f'{model}_u' for model in forecast_models] +
-                      [f'{model}_v' for model in forecast_models]].values
+df_vectors['gt_sector'] = df_vectors['gt_winddirection'].apply(get_wind_sector)
+sectors = sorted(df_vectors['gt_sector'].unique())
+sector_results = []
 
-# Targets are the ground truth values
+for sector in sectors:
+    sector_df = df_vectors[df_vectors['gt_sector'] == sector]
+    if len(sector_df) < 20: continue # Skip sectors with too little data
+
+    y_true_speed_sector = sector_df['gt_windspeed']
+    
+    for model in forecast_models:
+        y_pred_speed_sector = sector_df[f'{model}_windspeed']
+        rmse_speed_sector = np.sqrt(mean_squared_error(y_true_speed_sector, y_pred_speed_sector))
+        sector_results.append({'Sector': sector, 'Model': model, 'RMSE_Speed': rmse_speed_sector})
+
+sector_results_df = pd.DataFrame(sector_results)
+print("\nWind Speed RMSE by Sector (Lower is better):")
+# Pivot for easy comparison
+print(sector_results_df.pivot(index='Sector', columns='Model', values='RMSE_Speed'))
+
+
+################################################################################
+# 4. Meta-Forecast with PyTorch (IMPROVED MODEL)
+################################################################################
+
+print("\n--- Building an Improved Corrective Model with PyTorch ---")
+
+# ### NEW SECTION: METHOD 2 - FEATURE ENGINEERING FOR PYTORCH MODEL ###
+# We will use AROME's predicted direction to create cyclical features.
+# AROME is often the higher-resolution model, making it a good choice.
+best_model_for_features = 'arome_france' 
+arome_dir_rad = np.deg2rad(df_vectors[f'{best_model_for_features}_winddirection'])
+df_vectors['arome_dir_sin'] = np.sin(arome_dir_rad)
+df_vectors['arome_dir_cos'] = np.cos(arome_dir_rad)
+
+print("Added 'arome_dir_sin' and 'arome_dir_cos' as new features.")
+
+# 1. Prepare Data with the new features
+features_cols = ([f'{model}_windspeed' for model in forecast_models] +
+                 [f'{model}_u' for model in forecast_models] +
+                 [f'{model}_v' for model in forecast_models] +
+                 ['arome_dir_sin', 'arome_dir_cos']) # Add the new features here
+
+features = df_vectors[features_cols].values
 targets = df_vectors[['gt_windspeed', 'gt_u', 'gt_v']].values
 
 # Split data
@@ -350,7 +202,6 @@ y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
 X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
 y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
 
-# Create DataLoader
 train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
 train_loader = DataLoader(dataset=train_dataset, batch_size=64, shuffle=True)
 
@@ -370,42 +221,35 @@ class WindNet(nn.Module):
         return x
 
 # 3. Training the Model
-input_size = X_train.shape[1]
+input_size = X_train.shape[1] # This will now be larger due to new features
 output_size = y_train.shape[1]
 model = WindNet(input_size, output_size)
 
-criterion = nn.MSELoss() # Mean Squared Error for regression
+criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 num_epochs = 20
 for epoch in range(num_epochs):
     for i, (inputs, labels) in enumerate(train_loader):
-        # Forward pass
         outputs = model(inputs)
         loss = criterion(outputs, labels)
-        
-        # Backward and optimize
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
     if (epoch+1) % 5 == 0:
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
 
 # 4. Evaluate the PyTorch Model
 with torch.no_grad():
     model.eval()
-    y_pred_tensor = model(X_test_tensor)
-    y_pred_pytorch = y_pred_tensor.numpy()
+    y_pred_pytorch = model(X_test_tensor).numpy()
 
-# Calculate metrics for PyTorch model
 mae_speed_pytorch = mean_absolute_error(y_test[:, 0], y_pred_pytorch[:, 0])
 rmse_speed_pytorch = np.sqrt(mean_squared_error(y_test[:, 0], y_pred_pytorch[:, 0]))
-
 direction_error_pytorch = np.sqrt((y_test[:, 1] - y_pred_pytorch[:, 1])**2 + (y_test[:, 2] - y_pred_pytorch[:, 2])**2)
 mae_direction_pytorch = direction_error_pytorch.mean()
 
-results['PyTorch_Ensemble'] = {
+results['PyTorch_Ensemble_Improved'] = {
     'MAE_Speed': mae_speed_pytorch,
     'RMSE_Speed': rmse_speed_pytorch,
     'MAE_Direction_Vector': mae_direction_pytorch
@@ -413,10 +257,5 @@ results['PyTorch_Ensemble'] = {
 
 # Display final comparison
 final_results_df = pd.DataFrame(results).T
-print("\n--- Final Comparison Including PyTorch Model ---")
+print("\n--- Final Comparison Including Improved PyTorch Model ---")
 print(final_results_df.sort_values(by='RMSE_Speed'))
-
-############################
-# 4. Predict Day after
-############################
-
