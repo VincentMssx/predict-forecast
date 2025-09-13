@@ -1,261 +1,291 @@
-import sys
 import pandas as pd
 import requests
-import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import joblib
 
 ################################################################################
-# 1. Get Data (Using a longer, more robust date range for better training)
+# 1. Get and Prepare Data
 ################################################################################
 
 # --- Configuration ---
 LATITUDE = 46.244
 LONGITUDE = -1.561
-START_DATE = "2025-09-01"
+# A "big" network requires more data. Let's fetch 2 years.
+START_DATE = "2019-01-01"
 END_DATE = "2025-09-13"
 
-# --- Function to Fetch Data from Open-Meteo ---
+# --- Fetching Functions (Unchanged) ---
 def fetch_weather_data(api_url, params):
     try:
         response = requests.get(api_url, params=params)
         response.raise_for_status()
         data = response.json()
-        hourly_data = data['hourly']
-        df = pd.DataFrame(hourly_data)
+        df = pd.DataFrame(data['hourly'])
         df['time'] = pd.to_datetime(df['time'])
         df.set_index('time', inplace=True)
         return df
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         print(f"Error fetching data: {e}")
-        if 'response' in locals() and response.text:
-            print(f"API Response: {response.json().get('reason', 'No reason provided')}")
-        return None
-    except KeyError:
-        print("Error: 'hourly' key not found in API response.")
         return None
 
-# --- Fetch Ground Truth Data ---
-print("Fetching ground truth data (ERA5)...")
-historical_api_url = "https://archive-api.open-meteo.com/v1/archive"
-params_ground_truth = {
-    "latitude": LATITUDE, "longitude": LONGITUDE, "start_date": START_DATE,
-    "end_date": END_DATE, "hourly": "windspeed_10m,winddirection_10m"
-}
-ground_truth_df = fetch_weather_data(historical_api_url, params_ground_truth)
-ground_truth_df.rename(columns={'windspeed_10m': 'gt_windspeed', 'winddirection_10m': 'gt_winddirection'}, inplace=True)
+# --- Data Acquisition ---
+print("Fetching historical data...")
+archive_api_url = "https://archive-api.open-meteo.com/v1/archive"
+HOURLY_VARS = "windspeed_10m,winddirection_10m,temperature_2m,relativehumidity_2m,surface_pressure"
+params_gt = {"latitude": LATITUDE, "longitude": LONGITUDE, "start_date": START_DATE, "end_date": END_DATE, "hourly": "windspeed_10m,winddirection_10m", "hourly": HOURLY_VARS}
+df_gt = fetch_weather_data(archive_api_url, params_gt)
+df_gt.rename(columns={'windspeed_10m': 'gt_windspeed', 'winddirection_10m': 'gt_winddirection'}, inplace=True)
 
-# --- Fetch Historical Forecast Data ---
-print("Fetching forecast data...")
-forecast_api_url = "https://api.open-meteo.com/v1/forecast"
-forecast_models = ["arome_france", "gfs_seamless"]
-forecast_dfs = {}
-for model in forecast_models:
-    print(f"  - Fetching {model}...")
-    params_forecast = {
-        "latitude": LATITUDE, "longitude": LONGITUDE, "start_date": START_DATE,
-        "end_date": END_DATE, "hourly": "windspeed_10m,winddirection_10m", "models": model
-    }
-    df = fetch_weather_data(forecast_api_url, params_forecast)
-    if df is not None:
-        df.rename(columns={
-            'windspeed_10m': f'{model}_windspeed',
-            'winddirection_10m': f'{model}_winddirection'
-        }, inplace=True)
-        forecast_dfs[model] = df
+params_arome = {**params_gt, "models": "arome_france"}
+df_arome = fetch_weather_data(archive_api_url, params_arome)
+df_arome.rename(columns={'windspeed_10m': 'arome_windspeed', 'winddirection_10m': 'arome_winddirection'}, inplace=True)
 
+params_gfs = {**params_gt, "models": "gfs_seamless"}
+df_gfs = fetch_weather_data(archive_api_url, params_gfs)
+df_gfs.rename(columns={'windspeed_10m': 'gfs_windspeed', 'winddirection_10m': 'gfs_winddirection'}, inplace=True)
 
-# --- Combine Data ---
-print("Combining all data sources...")
-if ground_truth_df is not None and forecast_dfs:
-    final_df = ground_truth_df
-    for model_name, forecast_df in forecast_dfs.items():
-        final_df = final_df.join(forecast_df, how='inner')
-    final_df.dropna(inplace=True)
-    if final_df.empty:
-        print("No overlapping data found. Exiting.")
-        exit()
-    print("Data successfully downloaded and combined.")
-else:
-    print("Failed to download or combine data. Exiting.")
-    exit()
+# --- Combine and Convert to Vectors ---
+print("Combining and processing data...")
+final_df = df_gt.join([df_arome, df_gfs], how='inner').dropna()
 
-
-################################################################################
-# 2. Data Preparation and Vector Conversion
-################################################################################
-
-# *** THIS IS THE CORRECTED, MORE ROBUST to_vector FUNCTION ***
-def to_vector(df):
-    direction_cols = [col for col in df.columns if 'winddirection' in col]
-    for dir_col in direction_cols:
-        speed_col = dir_col.replace('winddirection', 'windspeed')
-        prefix = dir_col.replace('winddirection', '')
-        if speed_col in df.columns:
-            speed = df[speed_col]
-            direction_rad = np.deg2rad(df[dir_col])
-            df[f'{prefix}u'] = -speed * np.sin(direction_rad)
-            df[f'{prefix}v'] = -speed * np.cos(direction_rad)
+def to_vector(df, prefix):
+    speed_col = f'{prefix}_windspeed'
+    dir_col = f'{prefix}_winddirection'
+    rad = np.deg2rad(df[dir_col])
+    speed = df[speed_col]
+    df[f'{prefix}_u'] = -speed * np.sin(rad)
+    df[f'{prefix}_v'] = -speed * np.cos(rad)
     return df
 
-df_vectors = to_vector(final_df.copy())
-print(df_vectors.describe())
-print("\nVector columns created successfully.")
+final_df = to_vector(final_df, 'gt')
+final_df = to_vector(final_df, 'arome')
+final_df = to_vector(final_df, 'gfs')
 
+# --- Feature Selection and Scaling ---
+features_df = final_df[['gt_u', 'gt_v', 'arome_u', 'arome_v', 'gfs_u', 'gfs_v']]
 
-################################################################################
-# 3. Model Evaluation (Overall and by Direction)
-################################################################################
-
-print("\n--- Evaluating Models with Scikit-learn (Overall Performance) ---")
-y_true_speed = df_vectors['gt_windspeed']
-y_true_u = df_vectors['gt_u']
-y_true_v = df_vectors['gt_v']
-results = {}
-
-for model in forecast_models:
-    y_pred_speed = df_vectors[f'{model}_windspeed']
-    mae_speed = mean_absolute_error(y_true_speed, y_pred_speed)
-    rmse_speed = np.sqrt(mean_squared_error(y_true_speed, y_pred_speed))
-    
-    y_pred_u = df_vectors[f'{model}_u']
-    y_pred_v = df_vectors[f'{model}_v']
-    direction_error = np.sqrt((y_true_u - y_pred_u)**2 + (y_true_v - y_pred_v)**2)
-    mae_direction = direction_error.mean()
-    
-    results[model] = {'MAE_Speed': mae_speed, 'RMSE_Speed': rmse_speed, 'MAE_Direction_Vector': mae_direction}
-
-results_df = pd.DataFrame(results).T
-print(results_df.sort_values(by='RMSE_Speed'))
-
-# ### NEW SECTION: METHOD 1 - ANALYZE PERFORMANCE BY WIND DIRECTION ###
-print("\n--- Evaluating Models by Wind Direction Sector ---")
-
-def get_wind_sector(deg):
-    if 337.5 <= deg <= 360 or 0 <= deg < 22.5: return 'N'
-    if 22.5 <= deg < 67.5: return 'NE'
-    if 67.5 <= deg < 112.5: return 'E'
-    if 112.5 <= deg < 157.5: return 'SE'
-    if 157.5 <= deg < 202.5: return 'S'
-    if 202.5 <= deg < 247.5: return 'SW'
-    if 247.5 <= deg < 292.5: return 'W'
-    if 292.5 <= deg < 337.5: return 'NW'
-
-df_vectors['gt_sector'] = df_vectors['gt_winddirection'].apply(get_wind_sector)
-sectors = sorted(df_vectors['gt_sector'].unique())
-sector_results = []
-
-for sector in sectors:
-    sector_df = df_vectors[df_vectors['gt_sector'] == sector]
-    if len(sector_df) < 20: continue # Skip sectors with too little data
-
-    y_true_speed_sector = sector_df['gt_windspeed']
-    
-    for model in forecast_models:
-        y_pred_speed_sector = sector_df[f'{model}_windspeed']
-        rmse_speed_sector = np.sqrt(mean_squared_error(y_true_speed_sector, y_pred_speed_sector))
-        sector_results.append({'Sector': sector, 'Model': model, 'RMSE_Speed': rmse_speed_sector})
-
-sector_results_df = pd.DataFrame(sector_results)
-print("\nWind Speed RMSE by Sector (Lower is better):")
-# Pivot for easy comparison
-print(sector_results_df.pivot(index='Sector', columns='Model', values='RMSE_Speed'))
-
+# Scaling is crucial for neural networks
+scaler = StandardScaler()
+features_scaled = scaler.fit_transform(features_df)
+scaled_df = pd.DataFrame(features_scaled, index=features_df.index, columns=features_df.columns)
 
 ################################################################################
-# 4. Meta-Forecast with PyTorch (IMPROVED MODEL)
+# 2. Create Time-Series Windows (Dataset Preparation)
 ################################################################################
+def create_dataset_windows(df):
+    X, y = [], []
+    # We need 48 hours for each sample (24 past, 24 future)
+    # The loop stops at len(df) - 48 to avoid index errors
+    for i in tqdm(range(len(df) - 48), desc="Creating windows"):
+        # We step by 24 hours to create one sample per day
+        if i % 24 != 0:
+            continue
 
-print("\n--- Building an Improved Corrective Model with PyTorch ---")
+        # Input Features: Past 24h of GT + Next 24h of Forecasts
+        past_gt = df[['gt_u', 'gt_v']].iloc[i : i+24].values
+        future_arome = df[['arome_u', 'arome_v']].iloc[i+24 : i+48].values
+        future_gfs = df[['gfs_u', 'gfs_v']].iloc[i+24 : i+48].values
+        diff_model = future_arome - future_gfs
+        final_df['hour_sin'] = np.sin(2 * np.pi * final_df.index.hour / 24.0)
+        final_df['hour_cos'] = np.cos(2 * np.pi * final_df.index.hour / 24.0)
+        
+        # Combine into a single input sequence for the day
+        # Shape: (24, 6) -> 24 hours, 6 features per hour
+        input_features = np.concatenate([past_gt, future_arome, future_gfs, diff_model, final_df], axis=1)
+        
+        # Target: Next 24h of actual Ground Truth
+        # Shape: (24, 2) -> 24 hours, 2 target values per hour
+        arome_forecast = df[['arome_u', 'arome_v']].iloc[i+24 : i+48].values
+        ground_truth = df[['gt_u', 'gt_v']].iloc[i+24 : i+48].values
+        target = ground_truth - arome_forecast # This is the "residual"
+        
+        X.append(input_features)
+        y.append(target)
+        
+    return np.array(X), np.array(y)
 
-# ### NEW SECTION: METHOD 2 - FEATURE ENGINEERING FOR PYTORCH MODEL ###
-# We will use AROME's predicted direction to create cyclical features.
-# AROME is often the higher-resolution model, making it a good choice.
-best_model_for_features = 'arome_france' 
-arome_dir_rad = np.deg2rad(df_vectors[f'{best_model_for_features}_winddirection'])
-df_vectors['arome_dir_sin'] = np.sin(arome_dir_rad)
-df_vectors['arome_dir_cos'] = np.cos(arome_dir_rad)
+print("\nStructuring data into daily windows for the neural network...")
+X, y = create_dataset_windows(scaled_df)
+print(f"Created {X.shape[0]} daily samples.")
+print(f"Shape of a single input sample (X): {X.shape[1]} hours x {X.shape[2]} features")
+print(f"Shape of a single target sample (y): {y.shape[1]} hours x {y.shape[2]} values")
 
-print("Added 'arome_dir_sin' and 'arome_dir_cos' as new features.")
+# --- Split and Create DataLoaders ---
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# 1. Prepare Data with the new features
-features_cols = ([f'{model}_windspeed' for model in forecast_models] +
-                 [f'{model}_u' for model in forecast_models] +
-                 [f'{model}_v' for model in forecast_models] +
-                 ['arome_dir_sin', 'arome_dir_cos']) # Add the new features here
+X_train_t = torch.tensor(X_train, dtype=torch.float32)
+y_train_t = torch.tensor(y_train, dtype=torch.float32)
+X_test_t = torch.tensor(X_test, dtype=torch.float32)
+y_test_t = torch.tensor(y_test, dtype=torch.float32)
 
-features = df_vectors[features_cols].values
-targets = df_vectors[['gt_windspeed', 'gt_u', 'gt_v']].values
+train_loader = DataLoader(TensorDataset(X_train_t, y_train_t), batch_size=32, shuffle=True)
+test_loader = DataLoader(TensorDataset(X_test_t, y_test_t), batch_size=32, shuffle=False)
 
-# Split data
-X_train, X_test, y_train, y_test = train_test_split(features, targets, test_size=0.2, random_state=42)
-
-# Convert to PyTorch Tensors
-X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
-X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
-
-train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-train_loader = DataLoader(dataset=train_dataset, batch_size=64, shuffle=True)
-
-# 2. Define the Neural Network
-class WindNet(nn.Module):
-    def __init__(self, input_size, output_size):
-        super(WindNet, self).__init__()
-        self.layer1 = nn.Linear(input_size, 64)
-        self.layer2 = nn.Linear(64, 32)
-        self.output_layer = nn.Linear(32, output_size)
-        self.relu = nn.ReLU()
+################################################################################
+# 3. Define the GRU Neural Network
+################################################################################
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    torch.device("cuda:0")
+    print("Running on GPU")
+else:
+    torch.device("cpu")
+    print("Running on CPU")
+class MetaForecastGRU(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers, dropout_prob):
+        super(MetaForecastGRU, self).__init__()
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True, # Critical for easy data handling
+            dropout=dropout_prob
+        )
+        self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
-        x = self.relu(self.layer1(x))
-        x = self.relu(self.layer2(x))
-        x = self.output_layer(x)
-        return x
+        # x shape: (batch_size, sequence_length, input_size)
+        # gru_out shape: (batch_size, sequence_length, hidden_size)
+        gru_out, _ = self.gru(x)
+        
+        # We apply the linear layer to every timestep of the sequence
+        # output shape: (batch_size, sequence_length, output_size)
+        output = self.fc(gru_out)
+        return output
 
-# 3. Training the Model
-input_size = X_train.shape[1] # This will now be larger due to new features
-output_size = y_train.shape[1]
-model = WindNet(input_size, output_size)
+# --- Model Instantiation ---
+INPUT_FEATURES = X.shape[2]    # Should be 6
+HIDDEN_SIZE = 1024             # As requested
+OUTPUT_SIZE = y.shape[2]       # Should be 2 (u, v)
+NUM_LAYERS = 2                 # 2 GRU layers stacked for more depth
+DROPOUT = 0.2                  # Regularization to prevent overfitting
 
+model = MetaForecastGRU(INPUT_FEATURES, HIDDEN_SIZE, OUTPUT_SIZE, NUM_LAYERS, DROPOUT)
+print("\nModel Architecture:")
+
+################################################################################
+# 4. Training the Model
+################################################################################
 criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adagrad(model.parameters(), lr=0.001)
+num_epochs = 50
 
-num_epochs = 20
+print(f"\nStarting training for {num_epochs} epochs...")
 for epoch in range(num_epochs):
-    for i, (inputs, labels) in enumerate(train_loader):
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
+    model.train()
+    running_loss = 0.0
+    for inputs, targets in train_loader:
         optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
         loss.backward()
         optimizer.step()
-    if (epoch+1) % 5 == 0:
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
+        running_loss += loss.item()
+    
+    avg_loss = running_loss / len(train_loader)
+    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.6f}")
 
-# 4. Evaluate the PyTorch Model
+################################################################################
+# 5. Evaluation and Visualization
+################################################################################
+print("\nEvaluating model on the test set...")
+model.eval()
+all_preds = []
 with torch.no_grad():
-    model.eval()
-    y_pred_pytorch = model(X_test_tensor).numpy()
+    for inputs, _ in test_loader:
+        outputs = model(inputs)
+        all_preds.append(outputs.numpy())
 
-mae_speed_pytorch = mean_absolute_error(y_test[:, 0], y_pred_pytorch[:, 0])
-rmse_speed_pytorch = np.sqrt(mean_squared_error(y_test[:, 0], y_pred_pytorch[:, 0]))
-direction_error_pytorch = np.sqrt((y_test[:, 1] - y_pred_pytorch[:, 1])**2 + (y_test[:, 2] - y_pred_pytorch[:, 2])**2)
-mae_direction_pytorch = direction_error_pytorch.mean()
+# --- Inverse Transform and Compare ---
+# Reshape predictions and test data back to 2D for inverse scaling
+y_pred_flat = np.concatenate(all_preds).reshape(-1, OUTPUT_SIZE)
+y_test_flat = y_test.reshape(-1, OUTPUT_SIZE)
 
-results['PyTorch_Ensemble_Improved'] = {
-    'MAE_Speed': mae_speed_pytorch,
-    'RMSE_Speed': rmse_speed_pytorch,
-    'MAE_Direction_Vector': mae_direction_pytorch
-}
+# Create dummy arrays to match the scaler's original shape
+dummy_pred = np.zeros((len(y_pred_flat), len(features_df.columns)))
+dummy_pred[:, :OUTPUT_SIZE] = y_pred_flat
+y_pred_unscaled = scaler.inverse_transform(dummy_pred)[:, :OUTPUT_SIZE]
 
-# Display final comparison
-final_results_df = pd.DataFrame(results).T
-print("\n--- Final Comparison Including Improved PyTorch Model ---")
-print(final_results_df.sort_values(by='RMSE_Speed'))
+dummy_test = np.zeros((len(y_test_flat), len(features_df.columns)))
+dummy_test[:, :OUTPUT_SIZE] = y_test_flat
+y_test_unscaled = scaler.inverse_transform(dummy_test)[:, :OUTPUT_SIZE]
+
+# --- Calculate Final Metrics ---
+mae = mean_absolute_error(y_test_unscaled, y_pred_unscaled)
+rmse = np.sqrt(mean_squared_error(y_test_unscaled, y_pred_unscaled))
+print(f"Meta-Forecast MAE on u/v components: {mae:.4f}")
+print(f"Meta-Forecast RMSE on u/v components: {rmse:.4f}")
+
+# --- Visualize a Sample Prediction ---
+print("\nVisualizing a 24-hour forecast from the test set...")
+# Choose a random day from the test set
+sample_idx = np.random.randint(0, len(y_test))
+predicted_day = y_pred_unscaled.reshape(len(y_test), 24, 2)[sample_idx]
+actual_day = y_test_unscaled.reshape(len(y_test), 24, 2)[sample_idx]
+
+#  Get the original data for this sample day for comparison and date 
+start_index_in_df = (sample_idx * 24) + 24 # We skip the first 24h used as past_gt
+target_day_df = final_df.iloc[start_index_in_df : start_index_in_df + 24]
+
+# Get the date for the title
+target_date = target_day_df.index[0].strftime('%Y-%m-%d')
+
+# Get the raw AROME and GFS forecasts for that same day
+arome_day_raw = target_day_df[['arome_u', 'arome_v']].values
+gfs_day_raw = target_day_df[['gfs_u', 'gfs_v']].values
+
+# For comparison, get the raw AROME forecast for that same day
+# First, find the original index in the main dataframe
+original_idx = scaled_df.index.get_loc(scaled_df.iloc[sample_idx*24+24:sample_idx*24+48].index[0])
+arome_day_raw = final_df[['arome_u', 'arome_v']].iloc[original_idx:original_idx+24].values
+
+# Convert u,v back to speed for plotting
+def to_speed(u, v): return np.sqrt(u**2 + v**2)
+
+predicted_speed = to_speed(predicted_day[:, 0], predicted_day[:, 1])
+actual_speed = to_speed(actual_day[:, 0], actual_day[:, 1])
+arome_speed_raw = to_speed(arome_day_raw[:, 0], arome_day_raw[:, 1])
+gfs_speed_raw = to_speed(gfs_day_raw[:, 0], gfs_day_raw[:, 1])
+
+plt.figure(figsize=(16, 9))
+plt.plot(actual_speed, label='Ground Truth (Actual)', color='black', linewidth=2.5, marker='o', markersize=5)
+plt.plot(predicted_speed, label='Meta-Forecast (Our Model)', color='green', linestyle='--', linewidth=2, marker='x')
+plt.plot(gfs_speed_raw, label='GFS Raw Forecast', color='blue', linestyle=':', alpha=0.8)
+plt.plot(arome_speed_raw, label='AROME Raw Forecast', color='red', linestyle=':', alpha=0.8)
+plt.title(f'24-Hour Wind Speed Forecast Comparison for {target_date}')
+plt.xlabel('Hour of the Day')
+plt.ylabel('Wind Speed (km/h)')
+plt.xticks(np.arange(0, 24, 1))
+plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+################################################################################
+# 6. SAVE THE TRAINED MODEL AND SCALER
+################################################################################
+
+print("\nTraining complete. Saving model and scaler to disk...")
+
+# 1. Save the model's state dictionary
+MODEL_PATH = "meta_forecast_model.pth"
+torch.save(model.state_dict(), MODEL_PATH)
+print(f"Model saved to {MODEL_PATH}")
+
+# 2. Save the scaler object
+SCALER_PATH = "data_scaler.joblib"
+joblib.dump(scaler, SCALER_PATH)
+print(f"Scaler saved to {SCALER_PATH}")
+
+print("\nArtifacts are ready for prediction.")
+
+
